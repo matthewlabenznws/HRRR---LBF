@@ -1,12 +1,34 @@
 import os
+import urllib.request
+
 
 # ============================================================
 # BUILD SITE INDEX
 # ============================================================
 
 os.makedirs("site", exist_ok=True)
+os.makedirs(os.path.join("site", "assets"), exist_ok=True)
 
 index_path = os.path.join("site", "index.html")
+
+# gif.js is stored locally so GIF creation works reliably on the published site.
+gif_js_path = os.path.join("site", "assets", "gif.js")
+gif_worker_path = os.path.join("site", "assets", "gif.worker.js")
+
+gif_js_url = "https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.js"
+gif_worker_url = "https://cdnjs.cloudflare.com/ajax/libs/gif.js/0.2.0/gif.worker.js"
+
+for url, output_path in [
+    (gif_js_url, gif_js_path),
+    (gif_worker_url, gif_worker_path),
+]:
+    if not os.path.exists(output_path):
+        try:
+            urllib.request.urlretrieve(url, output_path)
+            print("Downloaded:", output_path)
+        except Exception as exc:
+            print(f"Warning: Could not download {url}: {exc}")
+
 
 html = """
 <!DOCTYPE html>
@@ -52,10 +74,35 @@ html = """
       background: #1b1b1b;
       border-bottom: 1px solid #444;
       padding: 8px 12px;
-      display: grid;
-      grid-template-columns: auto auto 1fr auto;
+      display: flex;
       gap: 10px;
       align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .controls input[type="range"] {
+      flex: 1 1 260px;
+      min-width: 180px;
+    }
+
+    .gif-controls {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .gif-label {
+      color: #bbb;
+      font-size: 13px;
+      font-weight: bold;
+    }
+
+    .save-status {
+      color: #bbb;
+      font-size: 12px;
+      min-width: 110px;
+      text-align: left;
     }
 
     select, button {
@@ -155,10 +202,21 @@ html = """
   </div>
 
   <div class="controls">
-    <button onclick="togglePlay()" id="playBtn">▶ Play</button>
+    <button onclick="togglePlay()" id="playBtn">â¶ Play</button>
     <button onclick="latestRun()">Latest</button>
+    <button onclick="savePNG()" id="pngBtn">Save PNG</button>
+
+    <div class="gif-controls">
+      <span class="gif-label">GIF:</span>
+      <select id="gifStart" aria-label="GIF start forecast hour"></select>
+      <span>to</span>
+      <select id="gifEnd" aria-label="GIF end forecast hour"></select>
+      <button onclick="saveGIF(this)" id="gifBtn">Save GIF</button>
+    </div>
+
     <input id="slider" type="range" min="0" max="60" value="0">
     <div id="fhrLabel">000</div>
+    <div class="save-status" id="saveStatus"></div>
   </div>
 
   <div class="tiles" id="tiles"></div>
@@ -167,8 +225,9 @@ html = """
     <img id="plot" src="" alt="NWS LBF model plot">
   </div>
 
-  <div class="hint">Use ←/→ arrow keys or forecast-hour buttons to step through frames.</div>
+  <div class="hint">Use â/â arrow keys or forecast-hour buttons to step through frames.</div>
 
+<script src="assets/gif.js"></script>
 <script>
 let runsByModelProduct = {
   hrrr: {
@@ -246,6 +305,9 @@ const modelSelect = document.getElementById("modelSelect");
 const runSelect = document.getElementById("runSelect");
 const productSelect = document.getElementById("productSelect");
 const domainSelect = document.getElementById("domainSelect");
+const gifStart = document.getElementById("gifStart");
+const gifEnd = document.getElementById("gifEnd");
+const saveStatus = document.getElementById("saveStatus");
 
 async function loadRunsJson(model, product) {
   const url = `runs/${model}/${product}/runs.json?t=${Date.now()}`;
@@ -385,6 +447,36 @@ function populateRunDropdown() {
   runSelect.value = selectedRun;
 }
 
+function populateGifHourDropdowns() {
+  const previousStart = Number(gifStart.value);
+  const previousEnd = Number(gifEnd.value);
+
+  gifStart.innerHTML = "";
+  gifEnd.innerHTML = "";
+
+  for (let i = 0; i <= maxFhr; i++) {
+    const startOption = document.createElement("option");
+    startOption.value = i;
+    startOption.textContent = "F" + fhrName(i);
+    gifStart.appendChild(startOption);
+
+    const endOption = document.createElement("option");
+    endOption.value = i;
+    endOption.textContent = "F" + fhrName(i);
+    gifEnd.appendChild(endOption);
+  }
+
+  gifStart.value =
+    Number.isFinite(previousStart) && previousStart >= 0 && previousStart <= maxFhr
+      ? previousStart
+      : 0;
+
+  gifEnd.value =
+    Number.isFinite(previousEnd) && previousEnd >= 0 && previousEnd <= maxFhr
+      ? previousEnd
+      : maxFhr;
+}
+
 function buildHourButtons() {
   tiles.innerHTML = "";
 
@@ -392,6 +484,8 @@ function buildHourButtons() {
   slider.max = maxFhr;
 
   if (current > maxFhr) current = maxFhr;
+
+  populateGifHourDropdowns();
 
   for (let i = 0; i <= maxFhr; i++) {
     const btn = document.createElement("button");
@@ -504,17 +598,211 @@ function latestRun() {
   setFrame(0);
 }
 
+
+function cleanImageUrl(src) {
+  return src.split("?")[0];
+}
+
+function downloadBlob(blob, filename) {
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = objectUrl;
+  link.download = filename;
+
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+
+  setTimeout(function() {
+    URL.revokeObjectURL(objectUrl);
+  }, 1000);
+}
+
+async function savePNG() {
+  const src = imgSrc(selectedRun, current);
+
+  if (!src) {
+    alert("No image is available to save.");
+    return;
+  }
+
+  saveStatus.textContent = "Saving PNG...";
+
+  try {
+    const response = await fetch(src);
+
+    if (!response.ok) {
+      throw new Error("Image request failed");
+    }
+
+    const blob = await response.blob();
+    const filename = cleanImageUrl(src).split("/").pop();
+
+    downloadBlob(blob, filename);
+    saveStatus.textContent = "PNG saved";
+  } catch (err) {
+    console.error("Could not save PNG:", err);
+    saveStatus.textContent = "";
+    alert("The current PNG could not be downloaded.");
+  }
+
+  setTimeout(function() {
+    saveStatus.textContent = "";
+  }, 2500);
+}
+
+async function loadGifFrame(src) {
+  return new Promise(function(resolve, reject) {
+    const img = new Image();
+
+    img.onload = function() {
+      resolve(img);
+    };
+
+    img.onerror = function() {
+      reject(new Error("Could not load " + src));
+    };
+
+    img.src = src;
+  });
+}
+
+async function saveGIF(btn) {
+  let startHour = Number(gifStart.value);
+  let endHour = Number(gifEnd.value);
+
+  if (!selectedRun) {
+    alert("No model run is available.");
+    return;
+  }
+
+  if (!Number.isInteger(startHour) || !Number.isInteger(endHour)) {
+    alert("Select valid GIF start and end hours.");
+    return;
+  }
+
+  if (startHour > endHour) {
+    const temporaryHour = startHour;
+    startHour = endHour;
+    endHour = temporaryHour;
+
+    gifStart.value = startHour;
+    gifEnd.value = endHour;
+  }
+
+  if (typeof GIF === "undefined") {
+    alert("The GIF library did not load. Check that site/assets/gif.js exists.");
+    return;
+  }
+
+  const originalText = btn.textContent;
+  const requestedFrames = endHour - startHour + 1;
+
+  btn.disabled = true;
+  btn.textContent = "Loading...";
+  saveStatus.textContent = "Preparing GIF";
+
+  const gif = new GIF({
+    workers: 2,
+    quality: 10,
+    workerScript: "assets/gif.worker.js"
+  });
+
+  let framesAdded = 0;
+
+  for (let fhr = startHour; fhr <= endHour; fhr++) {
+    const src = imgSrc(selectedRun, fhr);
+
+    btn.textContent =
+      "Loading " +
+      (fhr - startHour + 1) +
+      "/" +
+      requestedFrames;
+
+    saveStatus.textContent = "Checking F" + fhrName(fhr);
+
+    if (!src) continue;
+
+    try {
+      const img = await loadGifFrame(src);
+
+      gif.addFrame(img, {
+        delay: fhr === endHour ? 1000 : 450,
+        copy: true
+      });
+
+      framesAdded++;
+    } catch (err) {
+      console.warn("Skipping unavailable F" + fhrName(fhr), err);
+    }
+  }
+
+  if (framesAdded === 0) {
+    btn.disabled = false;
+    btn.textContent = originalText;
+    saveStatus.textContent = "";
+
+    alert("No available images were found in the selected forecast-hour range.");
+    return;
+  }
+
+  btn.textContent = "Creating...";
+  saveStatus.textContent =
+    "Rendering " + framesAdded + " frame" + (framesAdded === 1 ? "" : "s");
+
+  gif.on("progress", function(progress) {
+    saveStatus.textContent =
+      "Rendering " + Math.round(progress * 100) + "%";
+  });
+
+  gif.on("finished", function(blob) {
+    const filename =
+      selectedModel +
+      "_" +
+      selectedProduct +
+      "_" +
+      selectedRun +
+      "_" +
+      selectedDomain +
+      "_f" +
+      fhrName(startHour) +
+      "-f" +
+      fhrName(endHour) +
+      ".gif";
+
+    downloadBlob(blob, filename);
+
+    btn.disabled = false;
+    btn.textContent = originalText;
+    saveStatus.textContent = "GIF saved";
+
+    setTimeout(function() {
+      saveStatus.textContent = "";
+    }, 2500);
+  });
+
+  gif.on("abort", function() {
+    btn.disabled = false;
+    btn.textContent = originalText;
+    saveStatus.textContent = "";
+    alert("GIF creation was stopped.");
+  });
+
+  gif.render();
+}
+
 function togglePlay() {
   playing = !playing;
 
   if (playing) {
-    playBtn.innerHTML = "⏸ Pause";
+    playBtn.innerHTML = "â¸ Pause";
     timer = setInterval(function() {
       current = current >= maxFhr ? 0 : current + 1;
       setFrame(current);
     }, 650);
   } else {
-    playBtn.innerHTML = "▶ Play";
+    playBtn.innerHTML = "â¶ Play";
     clearInterval(timer);
   }
 }
